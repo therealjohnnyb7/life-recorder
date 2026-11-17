@@ -51,8 +51,17 @@ code{{overflow-wrap:anywhere;font-size:14px}}dt{{margin-top:20px;color:#666}}dd{
 <dt>Certificate fingerprint</dt><dd><code>{pin}</code></dd></dl></details>
 <p>This page contains your private pairing credential. Keep it private.</p>"""
 atomic_write(root / "pairing.html", page.encode())
-command = [sys.executable, str(Path(__file__).with_name("receiver.py").resolve()),
-           "--data-dir", str(root), "--host", "0.0.0.0", "--port", str(parsed.port or 443),
+def runtime_python() -> str:
+    # python.org's python3 re-execs Python.app, which App Nap can freeze in launchd.
+    for candidate in ("/opt/homebrew/bin/python3", "/usr/bin/python3"):
+        path = Path(candidate)
+        if path.exists() and "Python.app" not in os.path.realpath(path):
+            return str(path)
+    return sys.executable
+
+
+command = [runtime_python(), str(Path(__file__).with_name("receiver.py").resolve()),
+           "--data-dir", str(root), "--host", "::", "--port", str(parsed.port or 443),
            "--cert", str(cert), "--key", str(key), "--model", str(args.model.resolve()),
            "--whisper", "/opt/homebrew/bin/whisper-cli", "--ffmpeg", "/opt/homebrew/bin/ffmpeg"]
 atomic_write(root / "start-receiver.command", ("#!/bin/zsh\nexec " + shlex.join(command) + "\n").encode())
@@ -64,6 +73,7 @@ if args.install_agent:
     agent = agents / "com.browseruse.life-recorder.receiver.plist"
     payload = {"Label": "com.browseruse.life-recorder.receiver", "ProgramArguments": command,
                "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
+               "ProcessType": "Interactive",
                "WorkingDirectory": str(root), "Umask": 0o077,
                "StandardOutPath": str(root / "receiver.log"), "StandardErrorPath": str(root / "receiver-error.log")}
     if agent.exists():

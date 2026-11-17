@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -76,11 +78,20 @@ class Inbox:
         self.export()
         self.cleanup_completed()
 
+    @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.db, timeout=30)
+        db = sqlite3.connect(str(self.db), timeout=30)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.execute("PRAGMA busy_timeout=30000")
+            db.execute("PRAGMA synchronous=FULL")
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def receipt(self, chunk_id: str):
         with self.connect() as db:
@@ -243,6 +254,47 @@ class Handler(BaseHTTPRequestHandler):
 
 class Receiver(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+    ssl_context = None
+    _ssl_lock = threading.Lock()
+
+    def finish_request(self, request, client_address):
+        # Timeout first so a silent TCP client cannot hold the SSL lock forever.
+        # wrap_socket is serialized: concurrent OpenSSL wraps in this stdlib
+        # server have wedged the process even after the lock was removed.
+        sock = request
+        try:
+            sock.settimeout(10)
+            if self.ssl_context is not None:
+                with self._ssl_lock:
+                    sock = self.ssl_context.wrap_socket(sock, server_side=True)
+            self.RequestHandlerClass(sock, client_address, self)
+        except (ssl.SSLError, OSError, ConnectionError, TimeoutError):
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def shutdown_request(self, request):
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.close_request(request)
+
+
+class DualStackReceiver(Receiver):
+    """Owns the port on IPv6 and IPv4. iOS resolves the Mac's .local name to IPv6
+    first; an IPv4-only listener let an unrelated server on [::]:port take those
+    connections and fail every TLS upload."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 def transcribe(row, model: Path, work: Path, whisper: str, ffmpeg: str):
@@ -252,10 +304,12 @@ def transcribe(row, model: Path, work: Path, whisper: str, ffmpeg: str):
     try:
         subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", row["path"],
                         "-ar", "16000", "-ac", "1", str(wav)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=120, close_fds=True)
         subprocess.run([whisper, "-m", str(model), "-f", str(wav), "-l", "auto",
                         "-oj", "-of", str(prefix), "-nt"],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=600, close_fds=True)
         # whisper.cpp can emit a non-UTF-8 byte in otherwise valid JSON for
         # hallucinated noise. Replacement keeps the clip processable.
         output = json.loads(result_file.read_bytes().decode("utf-8", errors="replace"))
@@ -292,13 +346,47 @@ def clean_transcript(text: str) -> str:
     return " ".join(words)
 
 
+def watchdog(port: int, token: str, stop: threading.Event):
+    """Exit the process if HTTPS stops answering so launchd KeepAlive can restart it."""
+    ctx = ssl._create_unverified_context()
+    fails = 0
+    while not stop.wait(10):
+        try:
+            with socket.create_connection(("127.0.0.1", port), 4) as raw:
+                raw.settimeout(4)
+                ssock = ctx.wrap_socket(raw, server_hostname="localhost")
+                try:
+                    ssock.sendall(
+                        b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer "
+                        + token.encode()
+                        + b"\r\n\r\n"
+                    )
+                    if b" 200 " in ssock.recv(256):
+                        fails = 0
+                        continue
+                finally:
+                    ssock.close()
+        except Exception:
+            pass
+        fails += 1
+        if fails >= 2:
+            os._exit(1)
+
+
 def worker(inbox: Inbox, stop: threading.Event, model: Path, whisper: str, ffmpeg: str):
     work = inbox.root / "processing"
     work.mkdir(exist_ok=True, mode=0o700)
     while not stop.is_set():
-        with inbox.connect() as db:
-            row = db.execute("SELECT * FROM chunks WHERE status='pending' AND retry_at<=? ORDER BY started LIMIT 1",
-                             (time.time(),)).fetchone()
+        row = None
+        try:
+            with inbox.connect() as db:
+                row = db.execute(
+                    "SELECT * FROM chunks WHERE status='pending' AND retry_at<=? ORDER BY started LIMIT 1",
+                    (time.time(),),
+                ).fetchone()
+        except Exception:
+            stop.wait(2)
+            continue
         if not row:
             stop.wait(2)
             continue
@@ -308,10 +396,13 @@ def worker(inbox: Inbox, stop: threading.Event, model: Path, whisper: str, ffmpe
         except Exception as error:
             # Keep the audio and retry. Error type only; external-tool output is private.
             attempts = row["attempts"] + 1
-            with inbox.connect() as db:
-                db.execute("UPDATE chunks SET attempts=?,retry_at=?,error=? WHERE id=?",
-                           (attempts, time.time() + min(3600, 15 * 2 ** min(attempts, 8)),
-                            type(error).__name__, row["id"]))
+            try:
+                with inbox.connect() as db:
+                    db.execute("UPDATE chunks SET attempts=?,retry_at=?,error=? WHERE id=?",
+                               (attempts, time.time() + min(3600, 15 * 2 ** min(attempts, 8)),
+                                type(error).__name__, row["id"]))
+            except Exception:
+                stop.wait(2)
 
 
 def main():
@@ -335,16 +426,18 @@ def main():
         parser.error("Non-loopback listeners require --cert and --key")
     if args.model and (not args.model.is_file() or not args.whisper or not args.ffmpeg):
         parser.error("Transcription requires an existing model, whisper-cli, and ffmpeg")
-    server = Receiver((args.host, args.port), Handler)
+    server_class = DualStackReceiver if ":" in args.host else Receiver
+    server = server_class((args.host, args.port), Handler)
     server.inbox = inbox
     if args.cert and args.key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.cert, args.key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = context
     stop = threading.Event()
     if args.model:
         threading.Thread(target=worker, args=(inbox, stop, args.model, args.whisper, args.ffmpeg), daemon=True).start()
+    threading.Thread(target=watchdog, args=(args.port, inbox.token, stop), daemon=True).start()
     print(f"Receiver listening on {args.host}:{args.port}; local transcripts: {inbox.root / 'life.md'}", flush=True)
     try:
         server.serve_forever()

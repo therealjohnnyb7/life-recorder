@@ -10,7 +10,7 @@ import unittest
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "receiver"))
-from receiver import Handler, Inbox, Receiver
+from receiver import DualStackReceiver, Handler, Inbox, Receiver
 
 
 class ReceiverTests(unittest.TestCase):
@@ -125,6 +125,29 @@ class ReceiverTests(unittest.TestCase):
             response = client.recv(4096)
         self.assertIn(b"400", response)
         self.assertIsNone(self.inbox.receipt(chunk_id))
+
+
+class DualStackTests(unittest.TestCase):
+    def test_wildcard_listener_owns_ipv4_and_ipv6(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server = DualStackReceiver(("::", 0), Handler)
+            server.inbox = Inbox(Path(temp))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                for host in ("127.0.0.1", "::1"):
+                    client = http.client.HTTPConnection(host, port, timeout=5)
+                    client.request("GET", "/health", headers={"Authorization": "Bearer " + server.inbox.token})
+                    self.assertEqual(client.getresponse().status, 200, host)
+                    client.close()
+                # Another process can no longer take the IPv6 side of the port.
+                with self.assertRaises(OSError):
+                    socket.create_server(("::", port), family=socket.AF_INET6, dualstack_ipv6=True)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__ == "__main__":
